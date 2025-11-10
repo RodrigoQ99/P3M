@@ -1,0 +1,736 @@
+#include "stm32l0xx.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+
+/* =================== Configurables =================== */
+#define MENU_SCROLL_PERIOD_MS 750
+#define PRESET_ROTATE_MS 1500
+#define DOUBLE_KEY_WINDOW_MS 900
+#define DEBOUNCE_MS 40u /* debounce para teclas/puerta */
+
+/* ----------------- GPIO bit helpers ------------------ */
+#ifndef GPIO_PIN_0
+#define GPIO_PIN_0 (1u<<0)
+#define GPIO_PIN_1 (1u<<1)
+#define GPIO_PIN_2 (1u<<2)
+#define GPIO_PIN_3 (1u<<3)
+#define GPIO_PIN_4 (1u<<4)
+#define GPIO_PIN_5 (1u<<5)
+#define GPIO_PIN_6 (1u<<6)
+#define GPIO_PIN_7 (1u<<7)
+#define GPIO_PIN_8 (1u<<8)
+#define GPIO_PIN_9 (1u<<9)
+#define GPIO_PIN_10 (1u<<10)
+#define GPIO_PIN_11 (1u<<11)
+#define GPIO_PIN_12 (1u<<12)
+#define GPIO_PIN_13 (1u<<13)
+#define GPIO_PIN_14 (1u<<14)
+#define GPIO_PIN_15 (1u<<15)
+#endif
+
+/* 1 = cátodo común, 0 = ánodo común */
+#define SEG_CC 1
+#define QSIZE 16
+
+/* =================== Stepper 28BYJ-48 =================== */
+#define MOTOR_EN_PORT GPIOA
+#define MOTOR_EN_PIN GPIO_PIN_0
+
+#define STP_PORT GPIOB
+#define STP_IN1 GPIO_PIN_3
+#define STP_IN2 GPIO_PIN_4
+#define STP_IN3 GPIO_PIN_5
+#define STP_IN4 GPIO_PIN_6
+
+/* (8 fases) IN1..IN4 (1=activo) */
+static const uint8_t STEP_SEQ[8] = {
+0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001
+};
+/* Velocidad (pasos por segundo). 1 vuelta. 205 ≈ 3 RPM. */
+#define STEPPER_SPS 405u
+
+static uint8_t stp_phase = 0;
+static uint8_t stp_enable = 0;
+static uint16_t stp_acc = 0;
+/* Dirección del stepper: +1 horario, -1 contrario */
+static int8_t stp_dir = +1;
+
+/* =================== Puerta por EXTI =================== */
+/* switch puerta (PB7 con pull-up; switch a GND) */
+#define DOOR_PORT GPIOB
+#define DOOR_PIN GPIO_PIN_7
+static volatile uint8_t door_closed = 1; /* 1= cerrada (activa-baja con pull-up) */
+static uint8_t door_pause = 0;
+/* debounce puerta por tiempo */
+static volatile uint32_t door_last_ms = 0;
+
+/* ----------------- GPIO helpers ------------------ */
+static inline void gpio_set(GPIO_TypeDef *p, uint32_t pin){ p->BSRR = pin; }
+static inline void gpio_clr(GPIO_TypeDef *p, uint32_t pin){ p->BRR = pin; }
+static inline uint32_t gpio_rd(GPIO_TypeDef *p, uint32_t pin){ return (p->IDR & pin); }
+
+/* =================== Sistema/UI =================== */
+static volatile uint8_t tick5ms=0;
+/* reloj en ms basado en TIM21: suma 5 por tick */
+static volatile uint32_t g_ms = 0;
+
+typedef enum { ST_IDLE=0, ST_SET_TIME, ST_SET_TEMP, ST_PRESET, ST_RUNNING, ST_PAUSE } state_t;
+static volatile state_t fsm_state = ST_IDLE;
+
+static volatile uint16_t time_set_s=0, time_left_s=0;
+static volatile uint8_t temp_set=0;
+static uint8_t have_temp=0;
+
+/* =================== Cola de teclas =================== */
+static uint8_t q[QSIZE]; static uint8_t qh=0, qt=0;
+static inline bool q_put(uint8_t v){ uint8_t n=(qh+1)&(QSIZE-1); if(n==qt) return false; q[qh]=v; qh=n; return true; }
+static inline bool q_get(uint8_t *o){ if(qt==qh) return false; *o=q[qt]; qt=(qt+1)&(QSIZE-1); return true; }
+
+/* =================== 7-seg =================== */
+static const uint8_t DIGCODE[16] = {
+0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F,0x77,0x7C,0x39,0x5E,0x79,0x71
+};
+static uint8_t seg_code[4]={0,0,0,0};
+static uint8_t mux_idx=0;
+
+/* =================== Scroll LCD Idle =================== */
+static const char menu_text[]="A=Tiempo B=Temperatura C=Alimentos ";
+static uint16_t menu_scroll_acc=0, menu_pos=0;
+
+/* =================== Presets =================== */
+static const char* PRESET_NAMES[4] = {"Palomitas 3:00","Carne 5:00","Sopa 3:00","Congelado 10:00"};
+static const uint16_t PRESET_TIMES[4] = {180, 300, 180, 600};
+static uint16_t preset_acc=0; static uint8_t preset_idx=0;
+/* Mantener fijo el texto del preset seleccionado hasta '*' */
+static uint8_t preset_locked = 0;
+
+/* ============== Prototipos ============== */
+static void clock_init(void);
+static void gpio_init(void);
+static void exti_init_keypad_door(void); /* [CONFIG EXTI] keypad+puerta */
+static void tim21_init_5ms(void);
+static void leds_update(void);
+static void buzzer_init(void);
+static void buzzer_tick_5ms(void);
+/* keypad ahora por EXTI → se elimina keypad_tick_5ms() */
+static void lcd_tick_5ms(void);
+static void fsm_tick_5ms(void);
+
+/* ============== LCD 4-bit ============== */
+static void lcd_pulse(void);
+static void lcd_put4(uint8_t vh);
+static void lcd_cmd(uint8_t c);
+static void lcd_data(uint8_t d);
+static void lcd_init_blocking(void);
+static void lcd_clear(void);
+static void lcd_goto(uint8_t col,uint8_t row);
+static void lcd_puts(const char *s);
+static void lcd_print_window16(const char *s,uint16_t len,uint16_t start);
+
+/* ============== 7-seg helpers ============== */
+static void seg_all_off(void);
+static void seg_enable_digit(uint8_t i);
+static void seg_set_segments(uint8_t code,uint8_t dp_on);
+
+/* ============== utils tiempo ============== */
+static void fmt_mmss(uint16_t sec,char *out);
+static uint16_t raw_to_seconds(uint16_t raw);
+static void show_time_7seg(uint16_t s);
+
+/* ¿Doble tecla '#' para invertir giro? */
+static uint8_t last_star=0, star_window=0;
+/* Doble '#' robusto con ventana en ms */
+static uint8_t pending_hash = 0; /* 1 = ya llegó el primer '#' */
+static uint16_t hash_ms = 0; /* tiempo restante de ventana */
+
+/* ============== BUZZER ============== */
+static uint8_t bz_state=0;
+static uint16_t on_t=0, off_ticks=0, left_beeps=0;
+
+static inline void buzzer_beep(uint8_t n, uint16_t on_ticks, uint16_t off_ticks_v){
+bz_state=1; on_t=on_ticks; off_ticks=off_ticks_v; left_beeps=n;
+}
+static inline void buzzer_beep3(void){ buzzer_beep(3,30,30); }
+static inline void buzzer_beep1(void){ buzzer_beep(1,18,25); }
+
+static void buzzer_init(void){ gpio_clr(GPIOA,GPIO_PIN_12); }
+static void buzzer_tick_5ms(void){
+switch(bz_state){
+case 0: break;
+case 1:
+if(on_t==0){ gpio_set(GPIOA,GPIO_PIN_12); bz_state=2; }
+else { gpio_clr(GPIOA,GPIO_PIN_12); on_t--; }
+break;
+case 2:
+if(off_ticks==0){
+if(--left_beeps==0){ gpio_clr(GPIOA,GPIO_PIN_12); bz_state=0; }
+else { bz_state=1; on_t = (on_t?on_t:18); off_ticks = (off_ticks?off_ticks:25); }
+} else {
+off_ticks--;
+}
+break;
+}
+}
+
+/* ============== Stepper ============== */
+static inline void stepper_coils_write(uint8_t m){
+if(m & 0x01) gpio_set(STP_PORT, STP_IN1); else gpio_clr(STP_PORT, STP_IN1);
+if(m & 0x02) gpio_set(STP_PORT, STP_IN2); else gpio_clr(STP_PORT, STP_IN2);
+if(m & 0x04) gpio_set(STP_PORT, STP_IN3); else gpio_clr(STP_PORT, STP_IN3);
+if(m & 0x08) gpio_set(STP_PORT, STP_IN4); else gpio_clr(STP_PORT, STP_IN4);
+}
+static inline void stepper_enable_power(uint8_t on){
+if(on){ gpio_set(MOTOR_EN_PORT, MOTOR_EN_PIN); }
+else { gpio_clr(MOTOR_EN_PORT, MOTOR_EN_PIN); }
+}
+static inline void stepper_start(void){
+stp_enable = 1; stp_acc = 0;
+stepper_enable_power(1);
+stepper_coils_write(STEP_SEQ[stp_phase]);
+}
+static inline void stepper_stop(void){
+stp_enable = 0;
+stepper_coils_write(0);
+stepper_enable_power(0);
+}
+static void stepper_tick_5ms(void){
+if(!stp_enable) return;
+stp_acc += STEPPER_SPS; /* 200 ticks de 5 ms por segundo */
+while(stp_acc >= 200){
+stp_acc -= 200;
+if(stp_dir > 0){
+stp_phase = (uint8_t)((stp_phase + 1) & 7); /* horario */
+}else{
+stp_phase = (uint8_t)((stp_phase + 7) & 7); /* antihorario */
+}
+stepper_coils_write(STEP_SEQ[stp_phase]);
+}
+}
+
+/* ============== MAIN ============== */
+int main(void){
+clock_init();
+gpio_init();
+exti_init_keypad_door(); /* [CONFIG EXTI] keypad (PC6..PC9) + puerta (PB7) */
+tim21_init_5ms();
+buzzer_init();
+
+lcd_init_blocking();
+lcd_clear();
+lcd_goto(0,0); lcd_puts("A=Tiempo B=Temp");
+lcd_goto(0,1); lcd_puts("Temp: --C");
+
+show_time_7seg(0);
+__enable_irq();
+
+for(;;){
+if(tick5ms){
+tick5ms=0;
+
+/* keypad por EXTI → se elimina keypad_tick_5ms(); */
+
+lcd_tick_5ms();
+buzzer_tick_5ms();
+/* puerta ahora se actualiza por EXTI con debounce → no hace falta door_tick_5ms(); */
+fsm_tick_5ms();
+stepper_tick_5ms();
+
+/* multiplex 7-seg */
+seg_all_off();
+seg_set_segments(seg_code[mux_idx], (mux_idx==1)?1:0);
+seg_enable_digit(mux_idx);
+mux_idx=(mux_idx+1)&3;
+}
+}
+}
+
+/* ============== Reloj/Timers ============== */
+static void clock_init(void){
+RCC->CR |= RCC_CR_HSION; while(!(RCC->CR & RCC_CR_HSIRDY));
+RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_HSI;
+
+/* GPIO y TIM */
+RCC->IOPENR |= RCC_IOPENR_IOPAEN|RCC_IOPENR_IOPBEN|RCC_IOPENR_IOPCEN;
+RCC->APB2ENR |= RCC_APB2ENR_TIM21EN;
+
+/* Requerido para EXTI → SYSCFG */
+RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+}
+static void tim21_init_5ms(void){
+TIM21->PSC=1599; TIM21->ARR=50-1; TIM21->CNT=0;
+TIM21->DIER|=TIM_DIER_UIE; TIM21->CR1|=TIM_CR1_CEN;
+NVIC_EnableIRQ(TIM21_IRQn);
+}
+void TIM21_IRQHandler(void){
+if(TIM21->SR & TIM_SR_UIF){
+TIM21->SR = ~TIM_SR_UIF;
+tick5ms=1;
+g_ms += 5; /* reloj base en ms para debounce y ventanas */
+}
+}
+
+/* ============== GPIO + LCD + Keypad base ============== */
+static void gpio_init(void){
+/* PA1..PA12 como salida (7seg, LEDs, buzzer) */
+for(uint8_t i=1;i<=12;i++){ GPIOA->MODER&=~(3u<<(i*2)); GPIOA->MODER|=(1u<<(i*2)); }
+/* PA0 como salida: MOTOR_EN (opcional) */
+GPIOA->MODER &= ~(3u<<(0*2));
+GPIOA->MODER |= (1u<<(0*2));
+gpio_clr(MOTOR_EN_PORT, MOTOR_EN_PIN);
+
+/* PB0,1,2,10 (7seg) + PB12..PB15 (filas keypad como salida) + PB3..PB6 (stepper) */
+uint8_t pinsB[]={0,1,2,3,4,5,6,10,12,13,14,15};
+for(uint8_t k=0;k<sizeof(pinsB);k++){
+uint8_t p=pinsB[k];
+GPIOB->MODER&=~(3u<<(p*2));
+GPIOB->MODER|=(1u<<(p*2)); /* salida */
+}
+/* PB7 entrada pull-up: puerta (EXTI) */
+GPIOB->MODER &= ~(3u<<(7*2));
+GPIOB->PUPDR &= ~(3u<<(7*2));
+GPIOB->PUPDR |= (1u<<(7*2)); /* pull-up */
+
+/* desenergiza stepper */
+gpio_clr(STP_PORT, STP_IN1|STP_IN2|STP_IN3|STP_IN4);
+
+/* PC0..PC5 LCD salida; PC6..PC9 columnas keypad con pull-up (EXTI) */
+for(uint8_t i=0;i<=5;i++){ GPIOC->MODER&=~(3u<<(i*2)); GPIOC->MODER|=(1u<<(i*2)); }
+for(uint8_t i=6;i<=9;i++){
+GPIOC->MODER&=~(3u<<(i*2)); /* entrada */
+GPIOC->PUPDR&=~(3u<<(i*2));
+GPIOC->PUPDR|=(1u<<(i*2)); /* pull-up */
+}
+
+#if SEG_CC
+gpio_clr(GPIOA, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8);
+#else
+gpio_set(GPIOA, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8);
+#endif
+gpio_set(GPIOB, GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15); /* filas = '1' por defecto */
+gpio_clr(GPIOA, GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11|GPIO_PIN_12);
+seg_all_off();
+
+door_closed = (gpio_rd(DOOR_PORT, DOOR_PIN) ? 0u : 1u);
+}
+
+/* ============== [CONFIG EXTI] Keypad (PC6..PC9) + Puerta (PB7) ============== */
+/* Mapa keypad: filas PB12..PB15, columnas PC6..PC9 */
+static const char keymap[4][4]={{'1','2','3','A'},{'4','5','6','B'},{'7','8','9','C'},{'*','0','#','D'}};
+/* timestamps para debounce por tecla */
+static volatile uint32_t key_last_ms[4][4] = {0};
+
+static void exti_init_keypad_door(void){
+/* --- Selección de puertos para EXTI en SYSCFG --- */
+/* Columnas PC6..PC9 → EXTI6..EXTI9 como puerto C */
+/* line 6-7 in EXTICR2, 8-9 in EXTICR3 */
+SYSCFG->EXTICR[1] &= ~(SYSCFG_EXTICR2_EXTI6 | SYSCFG_EXTICR2_EXTI7);
+SYSCFG->EXTICR[1] |= (SYSCFG_EXTICR2_EXTI6_PC | SYSCFG_EXTICR2_EXTI7_PC);
+SYSCFG->EXTICR[2] &= ~(SYSCFG_EXTICR3_EXTI8 | SYSCFG_EXTICR3_EXTI9);
+SYSCFG->EXTICR[2] |= (SYSCFG_EXTICR3_EXTI8_PC | SYSCFG_EXTICR3_EXTI9_PC);
+
+/* Puerta PB7 → EXTI7 como puerto B (sobrescribe la línea 7 a PB) */
+SYSCFG->EXTICR[1] &= ~(SYSCFG_EXTICR2_EXTI7);
+SYSCFG->EXTICR[1] |= (SYSCFG_EXTICR2_EXTI7_PB);
+
+/* --- Configura flancos: columnas FALLING (tecla presionada), puerta BOTH --- */
+/* Deshabilitar mientras configuro */
+EXTI->IMR &= ~(EXTI_IMR_IM6 | EXTI_IMR_IM7 | EXTI_IMR_IM8 | EXTI_IMR_IM9);
+
+/* columnas: flanco de bajada */
+EXTI->RTSR &= ~(EXTI_RTSR_TR6 | EXTI_RTSR_TR8 | EXTI_RTSR_TR9);
+EXTI->FTSR |= (EXTI_FTSR_TR6 | EXTI_FTSR_TR8 | EXTI_FTSR_TR9);
+
+/* línea 7 se usa para PUERTA (PB7) → ambos flancos */
+EXTI->RTSR |= (EXTI_RTSR_TR7);
+EXTI->FTSR |= (EXTI_FTSR_TR7);
+
+/* limpiar pending */
+EXTI->PR = (EXTI_PR_PIF6 | EXTI_PR_PIF7 | EXTI_PR_PIF8 | EXTI_PR_PIF9);
+
+/* habilitar */
+EXTI->IMR |= (EXTI_IMR_IM6 | EXTI_IMR_IM7 | EXTI_IMR_IM8 | EXTI_IMR_IM9);
+
+/* NVIC */
+NVIC_ClearPendingIRQ(EXTI4_15_IRQn);
+NVIC_SetPriority(EXTI4_15_IRQn, 1);
+NVIC_EnableIRQ(EXTI4_15_IRQn);
+}
+
+/* Escaneo rápido dentro de ISR para identificar (fila,col) activa
+Estrategia:
+- Poner filas PB12..PB15 en '1'
+- Para r=0..3: bajar solo esa fila a '0', breve delay, leer columnas PC6..PC9
+- Si alguna columna lee 0 → tecla (r,c) presionada.
+- Debounce por tiempo con g_ms y key_last_ms[r][c].
+*/
+static void keypad_scan_isr(void){
+const uint32_t ROW_MASK = GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
+/* todas high */
+gpio_set(GPIOB, ROW_MASK);
+
+for(uint8_t r=0; r<4; r++){
+/* set high todas, luego baja la fila r */
+gpio_set(GPIOB, ROW_MASK);
+gpio_clr(GPIOB, (GPIO_PIN_12<<r));
+/* pequeño settle */
+for(volatile int d=0; d<40; d++) __NOP();
+/* lee columnas (pull-up): 0=presionada */
+uint8_t c0 = (gpio_rd(GPIOC,GPIO_PIN_6)?1:0);
+uint8_t c1 = (gpio_rd(GPIOC,GPIO_PIN_7)?1:0);
+uint8_t c2 = (gpio_rd(GPIOC,GPIO_PIN_8)?1:0);
+uint8_t c3 = (gpio_rd(GPIOC,GPIO_PIN_9)?1:0);
+
+uint8_t cols = (c0<<0)|(c1<<1)|(c2<<2)|(c3<<3);
+for(uint8_t c=0; c<4; c++){
+if(((cols>>c)&1u)==0u){
+/* tecla (r,c) detectada en bajo */
+uint32_t *last = (uint32_t*)&key_last_ms[r][c];
+if((g_ms - *last) >= DEBOUNCE_MS){
+*last = g_ms;
+(void)q_put((uint8_t)keymap[r][c]);
+}
+}
+}
+}
+
+/* vuelve a dejar todas filas en '1' */
+gpio_set(GPIOB, ROW_MASK);
+}
+
+/* ============== 7-seg ============== */
+static void seg_all_off(void){
+#if SEG_CC
+gpio_set(GPIOB,GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10);
+#else
+gpio_clr(GPIOB,GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_10);
+#endif
+}
+static void seg_enable_digit(uint8_t i){
+#if SEG_CC
+switch(i){ case 0:gpio_clr(GPIOB,GPIO_PIN_0);break; case 1:gpio_clr(GPIOB,GPIO_PIN_1);break;
+case 2:gpio_clr(GPIOB,GPIO_PIN_2);break; case 3:gpio_clr(GPIOB,GPIO_PIN_10);break; }
+#else
+switch(i){ case 0:gpio_set(GPIOB,GPIO_PIN_0);break; case 1:gpio_set(GPIOB,GPIO_PIN_1);break;
+case 2:gpio_set(GPIOB,GPIO_PIN_2);break; case 3:gpio_set(GPIOB,GPIO_PIN_10);break; }
+#endif
+}
+static void seg_set_segments(uint8_t code,uint8_t dp_on){
+for(uint8_t b=0;b<7;b++){
+uint32_t pin=(GPIO_PIN_1<<b); /* PA1..PA7 = a..g */
+#if SEG_CC
+if(code&(1u<<b)) gpio_set(GPIOA,pin); else gpio_clr(GPIOA,pin);
+#else
+if(code&(1u<<b)) gpio_clr(GPIOA,pin); else gpio_set(GPIOA,pin);
+#endif
+}
+#if SEG_CC
+if(dp_on) gpio_set(GPIOA,GPIO_PIN_8); else gpio_clr(GPIOA,GPIO_PIN_8);
+#else
+if(dp_on) gpio_clr(GPIOA,GPIO_PIN_8); else gpio_set(GPIOA,GPIO_PIN_8);
+#endif
+}
+static void show_time_7seg(uint16_t s){
+uint8_t mT=(s/60)/10, mU=(s/60)%10, sT=(s%60)/10, sU=(s%60)%10;
+seg_code[0]=DIGCODE[mT]; seg_code[1]=DIGCODE[mU]; seg_code[2]=DIGCODE[sT]; seg_code[3]=DIGCODE[sU];
+}
+
+/* ============== LCD (4-bit) ============== */
+static inline void LCD_RS(uint8_t v){ v?gpio_set(GPIOC,GPIO_PIN_0):gpio_clr(GPIOC,GPIO_PIN_0); }
+static inline void LCD_EH(void){ gpio_set(GPIOC,GPIO_PIN_1); }
+static inline void LCD_EL(void){ gpio_clr(GPIOC,GPIO_PIN_1); }
+static inline void LCD_PUT4(uint8_t vh){
+(vh&0x10)?gpio_set(GPIOC,GPIO_PIN_2):gpio_clr(GPIOC,GPIO_PIN_2);
+(vh&0x20)?gpio_set(GPIOC,GPIO_PIN_3):gpio_clr(GPIOC,GPIO_PIN_3);
+(vh&0x40)?gpio_set(GPIOC,GPIO_PIN_4):gpio_clr(GPIOC,GPIO_PIN_4);
+(vh&0x80)?gpio_set(GPIOC,GPIO_PIN_5):gpio_clr(GPIOC,GPIO_PIN_5);
+}
+static void lcd_pulse(void){ LCD_EH(); for(volatile int i=0;i<40;i++) __NOP(); LCD_EL(); }
+static void lcd_put4(uint8_t vh){ LCD_PUT4(vh); lcd_pulse(); }
+static void lcd_cmd(uint8_t c){
+LCD_RS(0); lcd_put4(c&0xF0); lcd_put4(c<<4);
+if(c==0x01 || c==0x02){ for(volatile int i=0;i<32000;i++) __NOP(); }
+else { for(volatile int i=0;i<900;i++) __NOP(); }
+}
+static void lcd_data(uint8_t d){ LCD_RS(1); lcd_put4(d&0xF0); lcd_put4(d<<4); for(volatile int i=0;i<300;i++) __NOP(); }
+static void lcd_init_blocking(void){
+for(volatile int i=0;i<40000;i++) __NOP();
+LCD_RS(0); LCD_EL();
+lcd_put4(0x30); for(volatile int i=0;i<10000;i++) __NOP();
+lcd_put4(0x30); for(volatile int i=0;i<2000;i++) __NOP();
+lcd_put4(0x20); for(volatile int i=0;i<2000;i++) __NOP();
+lcd_cmd(0x28); lcd_cmd(0x08); lcd_cmd(0x01); lcd_cmd(0x06); lcd_cmd(0x0C);
+}
+static void lcd_clear(void){ lcd_cmd(0x01); }
+static void lcd_goto(uint8_t col,uint8_t row){ lcd_cmd(0x80 + (row?0x40:0x00) + col); }
+static void lcd_puts(const char *s){ while(*s) lcd_data(*s++); }
+static void lcd_print_window16(const char *s,uint16_t len,uint16_t start){
+char b[17]; for(int i=0;i<16;i++) b[i]=s[(start+i)%len]; b[16]='\0';
+lcd_goto(0,0); lcd_puts(b);
+}
+
+/* ============== FSM y helpers ============== */
+static void leds_update(void){
+gpio_clr(GPIOA,GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11);
+if(temp_set<=33) gpio_set(GPIOA,GPIO_PIN_9);
+else if(temp_set<=66) gpio_set(GPIOA,GPIO_PIN_10);
+else gpio_set(GPIOA,GPIO_PIN_11);
+}
+
+static void fmt_mmss(uint16_t s,char *out){
+uint16_t m=s/60, ss=s%60;
+out[0]='0'+((m/10)%10); out[1]='0'+(m%10); out[2]=':'; out[3]='0'+(ss/10); out[4]='0'+(ss%10); out[5]='\0';
+}
+static uint16_t raw_to_seconds(uint16_t raw){ return (raw/100u)*60u + (raw%100u); }
+
+static uint16_t edit_time_raw=0, edit_temp_raw=0;
+static uint16_t sec_acc_run=0;
+
+static void lcd_tick_5ms(void){
+if(fsm_state==ST_IDLE){
+menu_scroll_acc+=5;
+if(menu_scroll_acc>=MENU_SCROLL_PERIOD_MS){
+menu_scroll_acc=0;
+menu_pos=(menu_pos+1)%((uint16_t)(sizeof(menu_text)-1));
+lcd_print_window16(menu_text,(uint16_t)(sizeof(menu_text)-1),menu_pos);
+lcd_goto(0,1);
+if(have_temp){ char l2[17]; snprintf(l2,sizeof(l2),"Temp: %02uC",temp_set); lcd_puts(l2); }
+else lcd_puts("Temp: --C ");
+}
+} else if(fsm_state==ST_PRESET){
+if (preset_locked) return; /* mantener fijo hasta '*' */
+preset_acc+=5;
+if(preset_acc>=PRESET_ROTATE_MS){
+preset_acc=0;
+preset_idx=(preset_idx+1)&3;
+lcd_clear();
+lcd_goto(0,0); lcd_puts("Presets");
+lcd_goto(0,1); lcd_puts(PRESET_NAMES[preset_idx]);
+}
+}
+}
+
+static void start_if_possible(void){
+if(!door_closed) return;
+
+if(fsm_state == ST_PAUSE && time_left_s > 0){
+fsm_state = ST_RUNNING;
+sec_acc_run = 0;
+lcd_clear(); lcd_goto(0,0); lcd_puts("Calentando");
+show_time_7seg(time_left_s);
+stepper_start();
+door_pause = 0;
+return;
+}
+if(time_set_s > 0){
+time_left_s = time_set_s;
+show_time_7seg(time_left_s);
+lcd_clear(); lcd_goto(0,0); lcd_puts("Calentando");
+sec_acc_run = 0;
+fsm_state = ST_RUNNING;
+stepper_start();
+}
+}
+
+static void reset_all_to_idle(void){
+stepper_stop();
+time_left_s=0; time_set_s=0; edit_time_raw=0; edit_temp_raw=0;
+show_time_7seg(0); preset_idx=0; preset_acc=0;
+preset_locked = 0;
+lcd_clear(); lcd_goto(0,0); lcd_puts("A=tiempo B=temp");
+lcd_goto(0,1); lcd_puts("Temp: --C");
+fsm_state=ST_IDLE;
+}
+
+static void fsm_tick_5ms(void){
+uint8_t k;
+while(q_get(&k)){
+if(k=='#'){
+/* Doble '#': si hay uno pendiente y la ventana sigue viva, es el segundo */
+if (pending_hash && hash_ms > 0){
+pending_hash = 0;
+hash_ms = 0;
+
+if (fsm_state == ST_RUNNING || fsm_state == ST_PAUSE){
+stp_dir = (int8_t)-stp_dir; /* invertir sentido */
+buzzer_beep1();
+} else {
+/* fuera de RUN/PAUSE: atajo útil (p.ej. +10s) */
+time_left_s += 10;
+show_time_7seg(time_left_s);
+}
+continue;
+} else {
+/* primer '#' abre ventana */
+pending_hash = 1;
+hash_ms = DOUBLE_KEY_WINDOW_MS;
+}
+
+/* Un solo '#' (o el primero del doble) intenta iniciar/reanudar */
+if(fsm_state==ST_IDLE || fsm_state==ST_SET_TIME || fsm_state==ST_PRESET || fsm_state==ST_PAUSE){
+start_if_possible();
+}
+}
+else if(k=='*'){
+if(star_window && !last_star){
+reset_all_to_idle();
+last_star=1; continue;
+}
+last_star=1; star_window=1;
+
+/* Si hay preset anclado, liberarlo con '*' y volver a rotar */
+if (preset_locked){
+preset_locked = 0;
+if (fsm_state == ST_PRESET){
+lcd_clear();
+lcd_goto(0,0); lcd_puts("Presets");
+lcd_goto(0,1); lcd_puts(PRESET_NAMES[preset_idx]);
+}
+}
+
+if(fsm_state==ST_RUNNING){
+fsm_state=ST_PAUSE; lcd_clear(); lcd_goto(0,0); lcd_puts("Pausa");
+stepper_stop();
+door_pause = 0;
+} else if(fsm_state==ST_SET_TIME){
+edit_time_raw /= 10;
+uint16_t s=raw_to_seconds(edit_time_raw); char t[6]; fmt_mmss(s,t);
+lcd_goto(0,0); lcd_puts("Tiempo ");
+lcd_goto(0,1); lcd_puts("Valor: "); lcd_puts(t); lcd_puts(" ");
+time_set_s=s; show_time_7seg(time_set_s);
+} else if(fsm_state==ST_SET_TEMP){
+edit_temp_raw /= 10;
+if(edit_temp_raw>100) edit_temp_raw=100;
+char l2[17]; snprintf(l2,sizeof(l2),"Valor: %3uC ",(unsigned)edit_temp_raw);
+lcd_goto(0,1); lcd_puts(l2);
+} else {
+lcd_clear();
+if(have_temp){ lcd_goto(0,1); char l2[17]; snprintf(l2,sizeof(l2),"Temp: %02uC",temp_set); lcd_puts(l2); }
+}
+}
+else if(k=='A'){
+fsm_state=ST_SET_TIME; edit_time_raw=0;
+lcd_clear(); lcd_goto(0,0); lcd_puts("Tiempo");
+lcd_goto(0,1); lcd_puts("Valor: 00:00");
+}
+else if(k=='B'){
+fsm_state=ST_SET_TEMP; edit_temp_raw=0;
+lcd_clear(); lcd_goto(0,0); lcd_puts("Temperatura");
+lcd_goto(0,1); lcd_puts("Valor: 0C");
+}
+else if(k=='C'){
+fsm_state=ST_PRESET; preset_idx=0; preset_acc=0;
+preset_locked = 0; /* limpiar anclaje previo al entrar */
+lcd_clear(); lcd_goto(0,0); lcd_puts("Presets");
+lcd_goto(0,1); lcd_puts(PRESET_NAMES[preset_idx]);
+}
+else if(k>='0' && k<='9'){
+if(fsm_state==ST_SET_TIME){
+if(edit_time_raw<1000) edit_time_raw=edit_time_raw*10+(k-'0');
+uint16_t s=raw_to_seconds(edit_time_raw); char t[6]; fmt_mmss(s,t);
+lcd_goto(0,0); lcd_puts("Tiempo ");
+lcd_goto(0,1); lcd_puts("Valor: "); lcd_puts(t); lcd_puts(" ");
+time_set_s=s; show_time_7seg(time_set_s);
+} else if(fsm_state==ST_SET_TEMP){
+if(edit_temp_raw<100) edit_temp_raw = edit_temp_raw*10 + (k-'0');
+if(edit_temp_raw>100) edit_temp_raw=100;
+char l2[17]; snprintf(l2,sizeof(l2),"Valor: %3uC ",(unsigned)edit_temp_raw);
+lcd_goto(0,1); lcd_puts(l2);
+} else if(fsm_state==ST_PRESET){
+if(k>='1' && k<='4'){
+uint8_t idx=(uint8_t)(k-'1');
+time_set_s=PRESET_TIMES[idx];
+show_time_7seg(time_set_s);
+
+preset_locked = 1; /* anclar hasta '*' */
+lcd_clear();
+lcd_goto(0,0); lcd_puts("Seleccionado");
+lcd_goto(0,1); lcd_puts(PRESET_NAMES[idx]);
+}
+}
+}
+else if(k=='D' && fsm_state==ST_SET_TEMP){
+temp_set=(uint8_t)edit_temp_raw; have_temp=1; leds_update();
+lcd_clear(); lcd_goto(0,0); lcd_puts("Temp guardada");
+char l2[17]; snprintf(l2,sizeof(l2),"Temp: %02uC",temp_set); lcd_goto(0,1); lcd_puts(l2);
+fsm_state=ST_IDLE;
+}
+}
+
+/* Ventana de doble '*' como la tenías */
+if(star_window){ static uint16_t t=0; t+=5; if(t>=DOUBLE_KEY_WINDOW_MS){ t=0; star_window=0; last_star=0; } }
+
+/* Ventana de doble '#' en ms (tick de 5 ms) */
+if (pending_hash){
+if (hash_ms >= 5) hash_ms -= 5;
+else { pending_hash = 0; hash_ms = 0; }
+}
+
+/* Lógica de puerta con beep */
+static uint8_t last_door = 1;
+if(door_closed != last_door){
+if(!door_closed){
+if(fsm_state == ST_RUNNING){
+fsm_state = ST_PAUSE;
+lcd_clear(); lcd_goto(0,0); lcd_puts("Puerta abierta");
+stepper_stop();
+door_pause = 1;
+}
+buzzer_beep1();
+} else {
+if(door_pause && time_left_s > 0){
+start_if_possible();
+door_pause = 0;
+}
+buzzer_beep1();
+}
+last_door = door_closed;
+}
+
+/* Conteo cuando corre */
+if(fsm_state==ST_RUNNING){
+sec_acc_run+=5;
+if(sec_acc_run>=1000){
+sec_acc_run=0;
+if(time_left_s>0){
+time_left_s--; show_time_7seg(time_left_s);
+char t[6]; fmt_mmss(time_left_s,t);
+lcd_goto(0,0); lcd_puts("Calentando ");
+lcd_goto(0,1); lcd_puts("Tiempo: "); lcd_puts(t); lcd_puts(" ");
+}else{
+fsm_state=ST_IDLE; buzzer_beep3();
+lcd_clear(); lcd_goto(0,0); lcd_puts("Finalizado");
+show_time_7seg(0);
+stepper_stop();
+}
+}
+}
+}
+
+/* ============== [INTERRUPCIÓN] EXTI4_15 ============== */
+/* Maneja:
+- Columnas keypad PC6, PC8, PC9 (falling) (PC7 también, pero la línea 7 la usa la puerta PB7)
+- Puerta PB7 (both edges)
+*/
+void EXTI4_15_IRQHandler(void){
+uint32_t pr = EXTI->PR;
+
+/* Columnas keypad: PC6, PC8, PC9 → si hay flag, escanear */
+if(pr & (EXTI_PR_PIF6 | EXTI_PR_PIF8 | EXTI_PR_PIF9)){
+EXTI->PR = (EXTI_PR_PIF6 | EXTI_PR_PIF8 | EXTI_PR_PIF9); /* limpiar */
+keypad_scan_isr(); /* identifica (fila,col), hace q_put() con debounce */
+}
+
+/* Puerta PB7 (ambos flancos) */
+if(pr & EXTI_PR_PIF7){
+EXTI->PR = EXTI_PR_PIF7; /* limpiar */
+/* debounce por tiempo */
+if((g_ms - door_last_ms) >= DEBOUNCE_MS){
+door_last_ms = g_ms;
+uint8_t raw = gpio_rd(DOOR_PORT, DOOR_PIN) ? 1u : 0u; /* 1=suelto (pull-up), 0=presionado (a GND) */
+door_closed = (raw == 0u) ? 1u : 0u;
+}
+}
+}
+
+
